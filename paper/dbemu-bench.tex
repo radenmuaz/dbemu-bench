@@ -1,0 +1,782 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=0pt,
+  showstringspaces=false,
+}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{\textbf{dbemu-bench}: \\
+A Benchmark for Database Emulation by Sequence Models}
+\author{}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We propose \emph{dbemu-bench}, a benchmark that stress-tests sequence
+models and large language models on \emph{emulating a database}: ingest an
+initial state, apply a long stream of operations, answer queries. The
+benchmark is structured along two orthogonal axes: (i) a
+\emph{strategy spectrum} of eleven points ranging from purely
+tensor-native execution (parameters, hidden states, KV-cache) through
+hybrid prompt-managed memory to agentic delegation to a real database
+engine, and (ii) a \emph{regime split} that separates context-limited
+transformers (which must adopt explicit memory-management strategies) from
+context-unlimited recurrent / state-space architectures (which expose
+state-bit-normalized capacity). Tasks are drawn from a 14-family taxonomy
+designed so that distinct failure modes (window cliffs, summarization
+loss, retrieval miss, planning error) each have at least one task that
+isolates them. Metrics are constructed from theoretically grounded
+primitives (cell-F1, Earth Mover's Distance, tree edit distance, mutual
+information / bits recovered, calibration) so that lossy and lossless
+outputs are scored on a common scale and partial correctness is rewarded
+on principle rather than by heuristic. The harness exposes a single
+\texttt{evaluate} entry point intended to support automated capability
+search by AI/ML research agents.
+\end{abstract}
+
+\section{Introduction}
+
+A database is, formally, a state machine: a typed store mutated by a
+stream of operations and interrogated by queries. ``Emulating'' a
+database is therefore a test of long-horizon, structured state tracking
+under arbitrary input distributions --- a capability that recurs in
+agentic LLM use, in retrieval-augmented systems, and in recent
+state-space and recurrent architectures.
+
+This benchmark unifies three concerns:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Architecture}: how much state a model can faithfully
+        carry per parameter, per KV byte, and per recurrent state bit.
+  \item \textbf{Strategy}: how a context-limited model manages an
+        operation stream that exceeds its window --- via eviction,
+        summarization, retrieval, or tool delegation.
+  \item \textbf{Agency}: how reliably a model orchestrates external
+        software (an opaque key-value store, a typed table, a real SQL
+        engine) when the database state is externalized.
+\end{enumerate}
+
+These three live on the same axis. Section~\ref{sec:spectrum} formalizes
+that axis as an eleven-point spectrum; the rest of the paper develops the
+inputs (\S\ref{sec:inputs}), operations (\S\ref{sec:ops}), tasks
+(\S\ref{sec:tasks}), metrics (\S\ref{sec:metrics}), stress dimensions
+(\S\ref{sec:stress}), baselines (\S\ref{sec:baselines}), and a
+research-agent API (\S\ref{sec:api}).
+
+\section{Inputs: state representations}
+\label{sec:inputs}
+
+The same logical database is rendered four ways so that format
+sensitivity is independently measurable:
+
+\begin{description}[leftmargin=*]
+  \item[SQLite.] Schema + rows; also the canonical ground-truth executor.
+  \item[JSON.] Documents per table, or a single nested object; tests
+    nested-state tracking.
+  \item[CSV.] Header + rows; tests flat tabular recall.
+  \item[FlatBuffers.] Schema-bound binary; tests strict-typed,
+    offset-addressed recall.
+\end{description}
+
+Each instance is a tuple
+$\langle \text{schema}, \text{initial\_state}, \text{op\_stream},
+\text{queries}\rangle$. The op stream is format-agnostic at the semantic
+level; the harness renders it into each surface form per run.
+
+\section{Operation grammar}
+\label{sec:ops}
+
+\begin{description}[leftmargin=*]
+  \item[DDL.] \texttt{CREATE / ALTER / DROP TABLE}, \texttt{CREATE INDEX}.
+  \item[DML.] \texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE},
+    \texttt{UPSERT}.
+  \item[Transaction.] \texttt{BEGIN}, \texttt{SAVEPOINT},
+    \texttt{ROLLBACK [TO sp]}, \texttt{COMMIT}.
+  \item[Query.] \texttt{SELECT} with filter, join, group-by, aggregate,
+    order, limit; \texttt{EXISTS}, \texttt{COUNT}.
+  \item[Time-travel.] \texttt{AS OF $\langle$op\_idx$\rangle$} (MVCC
+    snapshot reads).
+  \item[Bulk.] \texttt{IMPORT csv}, \texttt{MERGE}.
+\end{description}
+
+The op stream is the model's input after the initial state; queries are
+the evaluation points.
+
+\section{Two model regimes}
+\label{sec:regimes}
+
+\paragraph{Regime A --- context-limited transformer.}
+Stream length far exceeds the context window. The model must adopt an
+explicit memory strategy: sliding KV, summary checkpointing,
+hierarchical summarization, retrieval over past operations, external
+tool memory, or a learned compressor. Each strategy is a plug-in; the
+benchmark scores the \emph{strategy}, not just the underlying model.
+
+\paragraph{Regime B --- context-unlimited / fixed state.}
+For RNN, SSM (Mamba), RWKV, or any transformer with full window. Same
+tasks, no eviction. Adds a critical axis: state-size-normalized metrics
+(accuracy per bit of recurrent state). This is what makes the benchmark
+informative for architecture research, not just for prompting research.
+
+\section{The strategy spectrum: full-tensor to agentic-DB}
+\label{sec:spectrum}
+
+Eleven points, ordered by how much state leaves the model's tensors and
+lives in external software. Each is a valid \texttt{strategy} in the
+benchmark; the Pareto sweep across them is the principal research
+artifact.
+
+\begin{center}
+\small
+weights $\rightarrow$ hidden $\rightarrow$ KV $\rightarrow$ scratchpad
+$\rightarrow$ opaque KV $\rightarrow$ typed tool $\rightarrow$ SQL
+$\rightarrow$ planner+executor $\rightarrow$ pure DB
+\end{center}
+
+Along the axis:
+
+\begin{itemize}[leftmargin=*]
+  \item \emph{Where state lives}: parameters $\to$ activations $\to$
+    KV-cache $\to$ emitted tokens $\to$ external bytes.
+  \item \emph{Who interprets it}: the network $\to$ network + prompt
+    $\to$ external software.
+  \item \emph{What the benchmark measures}: architectural capacity $\to$
+    context-management capability $\to$ tool-use / planning capability.
+  \item \emph{Failure mode}: forgetting $\to$ eviction lossiness $\to$
+    tool-call errors $\to$ planning errors.
+\end{itemize}
+
+\subsection{Levels}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}r l l Y@{}}
+\toprule
+L & Name & State medium & Bench signal isolates \\
+\midrule
+0  & Parametric            & weights          & training-time memorization     \\
+1  & In-context            & KV (full)        & long-context attention         \\
+2  & Recurrent             & hidden state     & architecture / state bits      \\
+3  & Evicting KV           & bounded KV       & eviction policy                \\
+4  & Self-summary          & KV of digests    & model's compression sense      \\
+5  & Hierarchical / learned& layered codes    & budgeted compression           \\
+6  & Text scratchpad       & emitted tokens   & format discipline              \\
+7  & KV tool               & external bytes   & retrieval discipline           \\
+8  & Typed tool            & external typed   & schema + planning              \\
+9  & SQL tool              & real DB          & SQL competence                 \\
+10 & Planner / executor    & DB + plan trace  & meta-reasoning                 \\
+11 & Pure DB (oracle)      & DB               & ceiling                        \\
+\bottomrule
+\end{tabularx}
+\caption{The strategy spectrum.}
+\end{table}
+
+\paragraph{L0 --- Pure parametric.}
+State baked into weights. No runtime update. Tests memorization and
+generalization across schemas. Breaks on anything dynamic.
+
+\paragraph{L1 --- Pure in-context.}
+Full op-stream re-fed every call. State is the activation pattern induced
+by the prompt. Cost is $O(n^2)$ attention; breaks when stream length
+exceeds context.
+
+\paragraph{L2 --- Fixed-state recurrent.}
+State is the hidden vector. Single pass, no re-read. Tests pure
+state-tracking capacity per bit of state --- the architecture signal.
+Metrics are reported normalized by state bits.
+
+\paragraph{L3 --- KV-cache with eviction.}
+Sliding window, attention-score, or H2O-style policies. Bounded KV
+managed by a policy; the locality/recency profile diagnoses the policy.
+
+\paragraph{L4 --- Self-summarization.}
+The model emits a natural-language state snapshot at checkpoints; old
+tokens dropped, snapshot stays. Tests the model's ability to
+\emph{factor} state --- to separate variable from constant, hot from
+cold.
+
+\paragraph{L5 --- Hierarchical / learned compressor.}
+Multi-level digests (per 10, per 100, per 1000 ops) or a learned encoder
+packing rows into a fixed token budget. Tests lossy compression quality
+at a fixed budget.
+
+\paragraph{L6 --- Structured in-prompt scratchpad.}
+The model maintains an ASCII / Markdown / JSON table in its prompt and
+rewrites it each turn. Tests discipline, format adherence, size control.
+
+\paragraph{L7 --- Opaque external KV tool.}
+\texttt{kv.put(k,v)}, \texttt{kv.get(k)}, \texttt{kv.scan(prefix)}. No
+schema enforcement. Tests when to call, with what keys, and
+retrieval recall@k.
+
+\paragraph{L8 --- Typed table tool.}
+\texttt{table.create / insert / update / select} over a schema. Engine
+enforces types and uniqueness. Tests schema design and query planning,
+not state tracking.
+
+\paragraph{L9 --- Full SQL tool.}
+The model emits SQL against a real engine (SQLite). The engine
+\emph{is} the state. Tests SQL competence, schema understanding,
+transactional reasoning.
+
+\paragraph{L10 --- Planner / executor split.}
+The model is the planner only; decomposes intent into sub-tool calls
+(parser, optimizer, executor, verifier). Tests meta-reasoning and error
+recovery.
+
+\paragraph{L11 --- Pure DB passthrough (oracle).}
+No model in the loop. Ground-truth upper bound.
+
+\subsection{Why the spectrum matters}
+
+Each level collapses different metrics:
+
+\begin{itemize}[leftmargin=*]
+  \item \textbf{L0--L2}: state-bit-normalized accuracy is load-bearing;
+    tool-call counts are irrelevant.
+  \item \textbf{L3--L6}: locality / recency profile and cost-per-KV-byte
+    dominate.
+  \item \textbf{L7--L10}: tool-call count, tool-call correctness, plan
+    length dominate; raw recall approaches $1.0$ because the database
+    does the remembering.
+  \item \textbf{L11}: zero variance; pins the ceiling.
+\end{itemize}
+
+A complete benchmark run reports a single Pareto frontier across all
+eleven levels for each task family. The interesting research questions
+live in the gaps:
+
+\begin{itemize}[leftmargin=*]
+  \item Where does L2 overtake L3 per byte? The architectural advantage
+    of recurrence.
+  \item Where does L7 beat L4 per token? Externalization vs.\
+    compression.
+  \item Where does L9 stop helping? When planning errors eat the
+    externalization gains.
+\end{itemize}
+
+\section{Task taxonomy}
+\label{sec:tasks}
+
+Tasks are grouped by the failure mode they probe.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}l Y Y@{}}
+\toprule
+ID  & Name                          & Breaks                       \\
+\midrule
+T1  & Read-after-write fidelity     & weak recall                  \\
+T2  & Aggregate fidelity            & lossy summarization noise    \\
+T3  & Schema induction              & no schema tracking           \\
+T4  & Transactional consistency     & no tentative/committed split \\
+T5  & Long-range dependency         & sliding window (cliff)       \\
+T6  & Hash-table stress             & summary and RAG              \\
+T7  & Counter array                 & both window and summary      \\
+T8  & Cross-table join after stream & weak cross-state binding     \\
+T9  & Out-of-order replay           & naive autoregressive replay  \\
+T10 & MVCC snapshot read            & history discarded            \\
+T11 & Type coercion across formats  & non-invariant representations\\
+T12 & Adversarial tokenization      & near-duplicate key handling  \\
+T13 & Constraint enforcement        & no UNIQUE/FK/CHECK tracking  \\
+T14 & Bulk import + diff            & mix of wide-load and update  \\
+\bottomrule
+\end{tabularx}
+\caption{Task families.}
+\end{table}
+
+\section{Metrics}
+\label{sec:metrics}
+
+All scoring is built from theoretically grounded primitives so that
+lossless and lossy outputs are scored on a common scale and partial
+correctness is principled.
+
+\subsection{Lossless primitives}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Exact match} --- sanity check only.
+  \item \textbf{Cell-F1} over $(\text{table}, \text{row\_id},
+    \text{col}) \to \text{value}$ tuples, decomposed into row
+    precision/recall, column precision/recall, and value accuracy
+    conditional on row + column matched.
+  \item \textbf{Schema-F1} over $(\text{name}, \text{type})$ pairs.
+  \item \textbf{Order metric} (when \texttt{ORDER BY}): Kendall-$\tau$ on
+    the returned row sequence vs.\ ground truth.
+\end{itemize}
+
+\subsection{Lossy / aggregate primitives}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Relative error} for scalar aggregates:
+    $|p - t| / \max(|t|, \varepsilon)$.
+  \item \textbf{sMAPE} (bounded symmetric variant) for comparison across
+    magnitudes.
+  \item \textbf{Earth Mover's Distance} for histograms and group-by
+    distributions --- a true metric on distributions.
+  \item \textbf{Jaccard} and overlap@k for set- and top-k-valued
+    answers.
+  \item \textbf{Bucketed accuracy} with tolerance bands
+    ($1, 5, 10, 25\%$).
+\end{itemize}
+
+\subsection{Partial-credit primitives}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Tree edit distance} (Zhang--Shasha) over JSON / nested
+    rows.
+  \item \textbf{Row-tuple edit distance} over tables.
+  \item \textbf{Coverage--accuracy decomposition.} Define
+    \[
+      \mathrm{coverage} \;=\; \frac{|\text{cells\_attempted}|}{|\text{cells\_truth}|}, \quad
+      \mathrm{accuracy} \;=\; \frac{|\text{cells\_correct}|}{|\text{cells\_attempted}|}.
+    \]
+    Report both and their harmonic mean. This prevents
+    ``answer-only-what-you-know'' gaming.
+\end{itemize}
+
+\subsection{Information-theoretic composite}
+
+Let $T$ be the ground-truth table viewed as a random variable, $P$ the
+prediction. Define \textbf{bits recovered}
+\[
+  I(T; P) \;=\; H(T) \;-\; H(T \mid P),
+\]
+estimated empirically from the deterministic ground truth. For
+deterministic tables this reduces to
+\[
+  \mathrm{bits\_recovered} \;=\; \sum_{c \in \text{cols}}
+    H(c) \cdot \mathrm{cell\_accuracy}(c),
+\]
+yielding a single scalar that is additive across cells, comparable
+across tasks, and naturally normalized by total entropy:
+\[
+  \tilde{I} \;=\; \frac{I(T;P)}{H(T)} \;\in\; [0, 1].
+\]
+This $\tilde{I}$ is the default leaderboard scalar.
+
+\paragraph{Calibration.}
+When the model emits a per-cell distribution, report Brier score and
+expected calibration error (ECE). These separate
+\emph{wrong-and-confident} from \emph{wrong-and-uncertain} ---
+essential for honest scoring of context-limited regimes, where the model
+should know when it has forgotten.
+
+\paragraph{Generative scoring.}
+For generative models, report teacher-forced log-likelihood over the
+serialized ground truth as an additional, distribution-aware scalar.
+
+\subsection{Cost-aware metrics (for the Pareto)}
+
+\begin{itemize}[leftmargin=*]
+  \item bits recovered per prompt token,
+  \item bits recovered per KV byte (Regime A) or per state bit (Regime B),
+  \item bits recovered per wall-second and per FLOP.
+\end{itemize}
+
+\subsection{Locality / recency profiles}
+
+For T5, T6, and T10, plot accuracy vs.\ write-to-query lag. The shape
+diagnoses memory strategies:
+\begin{itemize}[leftmargin=*]
+  \item \emph{Cliff} $\Rightarrow$ sliding window;
+  \item \emph{Slow decay} $\Rightarrow$ summarization lossiness;
+  \item \emph{Flat} $\Rightarrow$ real memory.
+\end{itemize}
+
+\section{Stress dimensions}
+\label{sec:stress}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}l Y@{}}
+\toprule
+Axis & Values \\
+\midrule
+Stream length         & $10^2, 10^3, 10^4, 10^5, 10^6$            \\
+Schema width          & $1, 5, 25, 100$ cols                      \\
+Schema depth          & $0, 1, 3, 5$                              \\
+Keyspace size         & $10, 10^3, 10^5, 10^7$                    \\
+Write churn per key   & $1, 10, 100, 1000$                        \\
+Read / write ratio    & $0.01, 0.1, 1, 10$                        \\
+Query complexity      & scan, 1-join, 2-join, agg-group, subquery \\
+Format                & sqlite, json, csv, flatbuffers            \\
+Op ordering           & sorted, random, adversarial-shuffled      \\
+\bottomrule
+\end{tabularx}
+\caption{Stress dimensions swept by the generator.}
+\end{table}
+
+A single benchmark run is a seeded sparse-grid sample.
+
+\section{Reference baselines}
+\label{sec:baselines}
+
+The harness ships nine reference strategies, one per spectrum region:
+
+\begin{enumerate}[leftmargin=*]
+  \item Zero-shot LLM, full stream in context (when it fits).
+  \item Sliding-window LLM.
+  \item Summary-checkpoint LLM.
+  \item RAG-over-ops LLM.
+  \item Tool-memory LLM (write/read to a scratch KV store).
+  \item Hand-written stateful agent (oracle upper bound for that
+    strategy).
+  \item RNN baseline (LSTM).
+  \item SSM baseline (Mamba).
+  \item SQLite ground-truth (perfect-score reference).
+\end{enumerate}
+
+\section{Auto-research API}
+\label{sec:api}
+
+The harness exposes a single entry point so that an automated research
+agent can propose, run, and score a new memory strategy without engaging
+with task-specific plumbing:
+
+\begin{lstlisting}
+evaluate(strategy_fn, regime, axes_subset) -> {
+  scalar,         # normalized bits recovered (default leaderboard)
+  breakdown,      # per-task, per-axis dataframe
+  pareto_points   # (cost, accuracy) pairs for plotting
+}
+\end{lstlisting}
+
+The single \texttt{scalar} provides a leaderboard-comparable number;
+\texttt{breakdown} provides the diagnostic profile; \texttt{pareto\_points}
+support the cost / accuracy frontier that is the principal research
+artifact of the benchmark.
+
+\section{Continuous agents and why tensor-native emulation matters}
+\label{sec:continuous}
+
+\subsection{Two clocks}
+
+Almost every LLM agent today is \emph{event-driven}: input arrives, a
+prompt is built, a forward pass is run, tools are called, a reply is
+emitted, the agent goes idle. Between events the model does nothing. It
+has no internal clock and cannot consolidate, anticipate,
+garbage-collect, or rehearse.
+
+A recurrent or state-space model is structurally different. It runs a
+forward pass every tick:
+\[
+  h_t \;=\; f(h_{t-1}, x_t), \qquad x_t \in \mathcal{X} \cup \{\varnothing\}.
+\]
+The input $x_t$ is allowed to be empty; the state still advances. The
+agent has an internal clock decoupled from input arrival. This is the
+substrate on which a \emph{continuous agent} becomes possible:
+
+\begin{itemize}[leftmargin=*]
+  \item \emph{Idle compute}: forward passes consume time even when
+    nothing arrived; the model can use them to reorganize state.
+  \item \emph{Anticipation}: it can predict the next operation and
+    pre-compute partial answers before being asked.
+  \item \emph{Consolidation}: it can replay and compress recent ops
+    into a more compact internal representation --- a sleep / dream
+    analog.
+  \item \emph{Background maintenance}: it can re-derive invariants,
+    refresh derived aggregates, evict stale facts --- exactly the work
+    a real database does in the background.
+  \item \emph{Adaptive compute}: hard queries get more ticks; trivial
+    ones get fewer. Decoupling wall-clock from input is what makes
+    adaptive compute naturally expressible.
+\end{itemize}
+
+An event-driven transformer can imitate some of this with scratchpads
+and tool loops, but only by re-entering the prompt at every step. The
+continuous version is cheaper, lower-latency, and qualitatively
+different: the agent has \emph{interior time}.
+
+\subsection{A continuous DB-emulating agent}
+
+\begin{lstlisting}
+loop t = 0, 1, 2, ...
+    x_t  <- next_op_or_none()
+    h_t  <- f(h_{t-1}, x_t)
+    y_t  <- g(h_t)             # may be empty
+    emit(y_t) if salient
+end
+\end{lstlisting}
+
+Here $f$ is the recurrent update and $g$ a read-out head. The hidden
+state $h_t$ \emph{is} the database. When no op arrives, $f$ still runs:
+$h_t = f(h_{t-1}, \varnothing)$. That step is not wasted --- it is
+where internal reorganization happens.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}Y Y@{}}
+\toprule
+Idle-tick activity         & Database analog                       \\
+\midrule
+Re-compress hot keys       & rebuild B-tree pages, vacuum          \\
+Refresh derived aggregates & refresh materialized views            \\
+Pre-cache likely queries   & query plan cache warm-up              \\
+Detect / repair drift      & constraint check, fsck                \\
+Rehearse rare facts        & anti-forgetting replay                \\
+Predict next op            & speculative execution                 \\
+\bottomrule
+\end{tabularx}
+\caption{Useful uses of no-op forward passes.}
+\end{table}
+
+\subsection{Why tensor-native emulation is the load-bearing setting}
+
+The strategy spectrum (\S\ref{sec:spectrum}) runs from L0 (parametric)
+through L2 (recurrent / fixed-state) up to L11 (pure external DB). The
+agentic levels (L7--L11) are easier and, for engineering, often
+preferable. But they are not what a benchmark of \emph{sequence-model
+capability} should reward, for three reasons.
+
+\paragraph{Externalization launders the hard part.}
+If the model writes \texttt{INSERT INTO users\ldots} to SQLite, the
+remembering is done by SQLite. The model only has to parse intent,
+generate valid SQL, and read the result back. None of these tests
+state-tracking; all of them test translation. A small model with a SQL
+tool can score perfectly on a task that a large model without one
+cannot touch. The tool, not the model, did the work.
+
+\paragraph{Continuous agency requires internal state.}
+A continuous agent runs a forward pass every tick. If its state lives
+behind an RPC, every tick that touches state is at least one round-trip.
+That cannot be the substrate of an agent ticking per-token or at high
+frequency. Continuous agency \emph{requires} state in the tensors.
+Tool-memory is fine for episodic recall; it is wrong for moment-to-moment
+cognition.
+
+\paragraph{The bench should price what is hard.}
+The normalized bits-recovered scalar $\tilde{I}$ is the same number for
+L2 and L9, but the cost denominator changes. At L9 an extra bit costs
+roughly one extra SQL round-trip; at L2 it costs more recurrent state,
+i.e.\ better architecture. The L2 numbers move when architecture moves;
+the L9 numbers move when prompting moves. A benchmark that does not
+separate these axes will mis-rank progress.
+
+\subsection{The continuous-agent regime}
+
+We add one axis to the stress dimensions of \S\ref{sec:stress}:
+\textbf{idle ticks per op}, $\rho \in \{0, 1, 4, 16, 64, 256\}$. For
+every op the model receives $\rho$ no-op forward passes before the next
+op arrives. Reads are evaluated after the trailing idle window. The
+benchmark reports two derivatives:
+\begin{itemize}[leftmargin=*]
+  \item $\Delta_\rho$ --- accuracy gain per unit idle tick. A purely
+    reactive architecture has $\Delta_\rho = 0$; a genuinely continuous
+    one has $\Delta_\rho > 0$ and saturates.
+  \item Idle-compute efficiency --- bits recovered per idle-tick FLOP.
+    Distinguishes architectures that use idle compute well from ones
+    that spin.
+\end{itemize}
+
+Baselines added for this regime: ACT / PonderNet halting policies;
+Mamba / RWKV with looped feedback on $\varnothing$ input; and a
+``rumination'' wrapper over an LLM that lets it emit hidden scratchpad
+tokens during $\rho$ idle ticks.
+
+\subsection{Why this matters for automated AI research}
+
+If AI research is increasingly to be done by AI research agents, the
+benchmark must produce signals those agents can act on: sparse named
+failure modes, a single comparable scalar, a Pareto frontier rather
+than a leaderboard rank, and a continuous-agent axis that exposes the
+least-measured part of the design space: what to do with idle compute.
+Tensor-native database emulation, evaluated under both event-driven
+and continuous regimes, is the smallest setup that (i) forces all
+state into the substrate under study, (ii) exposes architectural
+capacity as a measurable quantity, (iii) admits agentic strategies as
+one end of a spectrum rather than the only option, and (iv) gives a
+place where ``thinking while idle'' is either rewarded or exposed as
+decorative.
+
+\section{Four concrete benchmarks}
+\label{sec:four}
+
+The design space above is too broad to ship as a single artifact. We
+carve it into four concrete benchmarks, each aimed at a distinct
+audience but sharing one operation grammar, one oracle (SQLite), and
+one JSON wire format $\langle \text{schema}, \text{initial\_state},
+\text{ops}, \text{queries}, \text{answers}? \rangle$.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}l Y Y Y@{}}
+\toprule
+Name & Audience & Shape & Metric \\
+\midrule
+\texttt{dbemu-mini}   & broad / Kaggle-style        & one dataset, one task, one metric    & cell-F1 \\
+\texttt{dbemu-static} & conference, model compare   & frozen subtasks (LongBench / ARC)    & bits recovered + macro \\
+\texttt{dbemu-env}    & conference, robustness      & procedural, seeded, hparam grid      & mean $\pm$ std \\
+\texttt{dbemu-train}  & from-scratch model research & env + curriculum + reward (SFT + RL) & training library \\
+\bottomrule
+\end{tabularx}
+\caption{Four concrete benchmarks derived from one underlying design.}
+\label{tab:four}
+\end{table}
+
+\subsection{\texttt{dbemu-mini} --- Kaggle-style}
+
+A drop-in eval anyone can run in five minutes.
+
+\begin{itemize}[leftmargin=*]
+  \item \emph{Format.} JSON, one instance per file. Fixed schema:
+    three tables, five columns each, INTEGER + TEXT only.
+  \item \emph{Initial state.} 100 rows per table.
+  \item \emph{Stream.} 1\,000 ops; 50 queries per instance (point-read
+    and small range-read only).
+  \item \emph{Output.} \texttt{predictions.json}: list of answers in
+    query order.
+  \item \emph{Metric.} Cell-F1, averaged over queries, averaged over
+    instances. One scalar.
+  \item \emph{Dataset.} 10\,000 instances; train (5\,k) / public test
+    (2.5\,k) / private test (2.5\,k). Frozen forever.
+  \item \emph{Env.} Pure offline; one Python scoring script, stdlib
+    only.
+\end{itemize}
+
+No regime split, no spectrum, no strategy slot. Just one number per
+submission. This is the entry-level benchmark; everything else is
+optional.
+
+\subsection{\texttt{dbemu-static} --- frozen subtasks}
+
+A citable comparison of off-the-shelf models across distinct capability
+slices --- same shape as LongBench or ARC: a frozen test set, a known
+taxonomy, a macro-average headline.
+
+\paragraph{Subtasks.}
+Five, each isolating one failure mode:
+\texttt{T1-read} (read-after-write fidelity),
+\texttt{T5-long} (long-range dependency, lag $\geq 10^5$),
+\texttt{T6-hash} (random-key hash-table stress),
+\texttt{T7-count} (counter-array stress),
+\texttt{T10-mvcc} (snapshot read at past op index).
+
+\paragraph{Protocol.}
+Splits 800 / 100 / 100 (train / dev / test) per subtask, frozen.
+Stream lengths mixed within each subtask: $10^3$, $10^4$, $10^5$.
+JSON format only (multi-format is deferred to \texttt{dbemu-env}).
+Metric: normalized bits recovered per subtask, macro-average as the
+leaderboard scalar.
+
+\paragraph{Two leaderboards.}
+\emph{Limited context} (8\,k tokens): models must declare and apply a
+named memory strategy. \emph{Unlimited context / recurrent}: no
+eviction; results additionally reported per recurrent state bit.
+
+\subsection{\texttt{dbemu-env} --- dynamic procedural env}
+
+Closer to Procgen than to ARC: the dataset is implied by a seeded
+generator, not shipped as files. Targets robustness, ablation, and
+cliff-finding studies.
+
+\paragraph{Hparam grid.}
+Stream length $\in \{10^2, 10^3, 10^4, 10^5, 10^6\}$; schema width
+$\in \{1, 5, 25, 100\}$; keyspace $\in \{10, 10^3, 10^5, 10^7\}$;
+churn per key $\in \{1, 10, 100, 1000\}$; read/write ratio
+$\in \{0.01, 0.1, 1, 10\}$; format
+$\in$ \{sqlite, json, csv, flatbuffers\}; idle ticks per op
+$\rho \in \{0, 1, 4, 16, 64, 256\}$ (the continuous-agent axis of
+\S\ref{sec:continuous}).
+
+\paragraph{Protocol.}
+50 seeds per (subtask, hparam point). Report mean $\pm$ std of bits
+recovered. Standard outputs: per-axis slice plots, Pareto frontiers
+(accuracy vs.\ cost), and the continuous-agent derivative
+$\Delta_\rho$.
+
+\subsection{\texttt{dbemu-train} --- training framework (no leaderboard)}
+
+The half of the design space that pure leaderboards cannot measure:
+letting a model learn to \emph{be} a database emulator from scratch,
+without depending on a pretrained LLM's emergent SQL skill.
+
+\paragraph{Env API (gym-like).}
+\begin{lstlisting}
+env = DBEmuEnv(seed, hparams)
+obs = env.reset()              # initial_state observation
+for op in stream:
+    obs, info = env.step(op)   # advances oracle, returns next obs
+ans = env.query(q)             # returns ground-truth answer
+\end{lstlisting}
+The env wraps the SQLite oracle in a deterministic stepping interface;
+\texttt{obs} is the configured state representation (full table, last
+op, idle tick, or empty).
+
+\paragraph{Data generators.}
+Infinite procedural stream from the grammar of \S\ref{sec:ops}, with a
+curriculum scheduler that stages hparams (small schema $\to$ wide;
+short stream $\to$ long; sorted ops $\to$ adversarial).
+
+\paragraph{SFT recipe.}
+Targets: per-cell tokens of the post-stream table. Loss:
+cross-entropy per cell, optionally curriculum-weighted by difficulty.
+Auxiliary: predict-next-op self-supervision.
+
+\paragraph{RL recipe.}
+Episode = (stream, queries). Action = emitted answer token sequence.
+Reward = bits recovered on the answer, with optional shaping (dense:
+per-query cell-accuracy delta; sparse: end-of-episode aggregate).
+Off-policy data from SFT generations is supported.
+
+\paragraph{Diagnostics.}
+A \emph{state probe} trains a linear head on the hidden state to
+predict the ground-truth table; probe accuracy upper-bounds any
+read-out head and distinguishes representational-capacity bottlenecks
+from read-out bottlenecks. A \emph{capacity curve} sweeps hidden-state
+size and reports bits recovered --- the clean architecture signal.
+
+\paragraph{Reference training scripts.}
+Small Mamba / RNN / decoder-only transformer trained from random init
+on the curriculum. The goal is to establish that the domain is
+\emph{learnable from scratch}, not merely amenable to large
+pretrained-LLM prompting.
+
+\subsection{Why the four-way split}
+
+\texttt{dbemu-mini} gives a low barrier and broad participation;
+\texttt{dbemu-static} provides a stable, citation-friendly comparison;
+\texttt{dbemu-env} supports research-grade ablation, robustness, and
+the continuous-agent regime; \texttt{dbemu-train} enables architecture
+and training-method work independent of frontier-model API access. The
+four share one grammar, one oracle, and one wire format, so progress
+on any one transfers to the others.
+
+\section{Conclusion}
+
+\emph{dbemu-bench} reduces a heterogeneous research surface --- recurrent
+state capacity, KV management, retrieval, tool use, agentic planning ---
+to a single benchmark organized around one operation: emulate a database.
+The eleven-point strategy spectrum unifies architecture studies and
+agent studies under a common scoring function, the information-theoretic
+\emph{bits recovered}; the task taxonomy ensures that each canonical
+failure mode is isolated by at least one task; and the harness API is
+narrow enough to be driven by an automated research agent. The benchmark
+should produce, for each model and strategy, a Pareto frontier in the
+(cost, fidelity) plane --- and the gaps in that frontier are the open
+research questions.
+
+\end{document}
